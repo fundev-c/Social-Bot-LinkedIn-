@@ -7,6 +7,7 @@ Integrates with MessageOrchestrator for task execution.
 import uuid
 from datetime import datetime
 from typing import Optional, List, Tuple
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 import structlog
 
@@ -54,24 +55,35 @@ class IdempotencyKeyExistsError(CampaignServiceError):
 
 class CampaignService:
     """
-    Campaign orchestration service.
+    Campaign orchestration service, scoped to one organization.
 
     Manages campaign lifecycle and integrates with MessageOrchestrator
     for task execution.
+
+    ``org_id`` is required and has no default. Everything this service can see
+    or touch belongs to that org; a campaign id from another tenant raises
+    ``CampaignNotFoundError`` exactly as a made-up id does.
+
+    The orchestrator callback path does not have a request context and so does
+    not use this class — see :func:`apply_task_result`.
     """
 
     def __init__(
         self,
         session: AsyncSession,
+        org_id: uuid.UUID,
+        user_id: Optional[uuid.UUID] = None,
         orchestrator=None,  # MessageOrchestrator instance
         redis_client=None   # Redis client for rate limiting checks
     ):
         self.session = session
+        self.org_id = org_id
+        self.user_id = user_id
         self.orchestrator = orchestrator
         self.redis = redis_client
-        self.campaign_repo = CampaignRepository(session)
+        self.campaign_repo = CampaignRepository(session, org_id=org_id)
         self.task_repo = CampaignTaskRepository(session)
-        self.idempotency_repo = IdempotencyRepository(session)
+        self.idempotency_repo = IdempotencyRepository(session, org_id=org_id)
 
     async def create_campaign(
         self,
@@ -106,7 +118,7 @@ class CampaignService:
                 )
 
         # Create campaign
-        campaign = await self.campaign_repo.create(data)
+        campaign = await self.campaign_repo.create(data, created_by_user_id=self.user_id)
 
         # Store idempotency key if provided
         if idempotency_key:
@@ -334,53 +346,6 @@ class CampaignService:
 
         return await self.task_repo.get_by_campaign(campaign_id, status)
 
-    async def update_task_status(
-        self,
-        orchestrator_task_id: str,
-        status: str,
-        result: Optional[dict] = None
-    ) -> None:
-        """
-        Update task status from orchestrator callback.
-
-        Also updates campaign progress counters.
-        """
-        task = await self.task_repo.update_status(
-            orchestrator_task_id,
-            status,
-            result
-        )
-
-        if not task:
-            logger.warning(
-                "task_not_found_for_status_update",
-                orchestrator_task_id=orchestrator_task_id
-            )
-            return
-
-        # Update campaign counters
-        if status == "completed":
-            await self.campaign_repo.increment_task_count(
-                task.campaign_id,
-                completed=1
-            )
-        elif status == "failed":
-            await self.campaign_repo.increment_task_count(
-                task.campaign_id,
-                failed=1
-            )
-
-        # Check if campaign is complete
-        progress = await self.campaign_repo.get_progress(task.campaign_id)
-        if progress.pending_tasks == 0:
-            # All tasks processed
-            await self.campaign_repo.update_status(
-                task.campaign_id,
-                CampaignStatusEnum.COMPLETED,
-                set_completed=True
-            )
-            logger.info("campaign_completed", campaign_id=str(task.campaign_id))
-
     def to_response(self, campaign: Campaign) -> CampaignResponse:
         """Convert Campaign model to response schema."""
         return CampaignResponse(
@@ -408,3 +373,65 @@ class CampaignService:
             created_at=campaign.created_at,
             updated_at=campaign.updated_at
         )
+
+
+async def apply_task_result(
+    session: AsyncSession,
+    orchestrator_task_id: str,
+    status: str,
+    result: Optional[dict] = None,
+) -> None:
+    """
+    Record a task outcome reported by the orchestrator, and roll it up.
+
+    This is the one campaign write with no request context behind it: the
+    orchestrator reports on its own schedule, long after the HTTP call that
+    started the campaign has returned. It is a module function rather than a
+    ``CampaignService`` method precisely so that class can keep ``org_id``
+    mandatory — the alternative was an ``org_id=None`` escape hatch on the
+    service, which is the door this whole change closes.
+
+    The tenant is *derived* from the task's campaign rather than supplied, so
+    there is still no path from caller input to a cross-org write.
+    """
+    task = await CampaignTaskRepository(session).update_status(
+        orchestrator_task_id, status, result
+    )
+
+    if not task:
+        logger.warning(
+            "task_not_found_for_status_update",
+            orchestrator_task_id=orchestrator_task_id
+        )
+        return
+
+    owner = await session.execute(
+        select(Campaign.org_id).where(Campaign.id == task.campaign_id)
+    )
+    org_id = owner.scalar_one_or_none()
+    if org_id is None:
+        logger.warning(
+            "campaign_missing_for_task",
+            orchestrator_task_id=orchestrator_task_id,
+            campaign_id=str(task.campaign_id),
+        )
+        return
+
+    repo = CampaignRepository(session, org_id=org_id)
+
+    # Update campaign counters
+    if status == "completed":
+        await repo.increment_task_count(task.campaign_id, completed=1)
+    elif status == "failed":
+        await repo.increment_task_count(task.campaign_id, failed=1)
+
+    # Check if campaign is complete
+    progress = await repo.get_progress(task.campaign_id)
+    if progress.pending_tasks == 0:
+        # All tasks processed
+        await repo.update_status(
+            task.campaign_id,
+            CampaignStatusEnum.COMPLETED,
+            set_completed=True
+        )
+        logger.info("campaign_completed", campaign_id=str(task.campaign_id))

@@ -196,6 +196,101 @@ async def warm_account(db, account):
     return account
 
 
+@pytest.fixture(scope="session")
+def clerk_keypair():
+    """
+    A throwaway RSA keypair published as a JWKS.
+
+    Lets tests sign genuine Clerk-shaped tokens and drive authenticated routes
+    end-to-end — through real signature verification and real JIT tenancy
+    provisioning — with no Clerk account and no network.
+    """
+    import json
+
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from jwt.algorithms import RSAAlgorithm
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = json.loads(RSAAlgorithm.to_jwk(private_key.public_key()))
+    jwk.update({"kid": "test-key-1", "use": "sig", "alg": "RS256"})
+    return private_key, {"keys": [jwk]}
+
+
+@pytest.fixture
+def issue_token(clerk_keypair):
+    """
+    Mint a signed session token for a given user (and optionally Clerk org).
+
+    Two tokens with the same ``org`` resolve to the same local Organization,
+    which is how cross-tenant isolation gets tested: same org = can see it,
+    different org = must not.
+    """
+    import time
+
+    import jwt
+
+    private_key, _ = clerk_keypair
+
+    def _issue(sub: str, *, org: str | None = None, email: str | None = None, ttl: int = 3600) -> str:
+        claims = {
+            "sub": sub,
+            "email": email or f"{sub}@example.com",
+            "exp": int(time.time()) + ttl,
+        }
+        if org:
+            claims["org_id"] = org
+        return jwt.encode(claims, private_key, algorithm="RS256", headers={"kid": "test-key-1"})
+
+    return _issue
+
+
+@pytest_asyncio.fixture
+async def api_client(clerk_keypair):
+    """
+    An HTTP client against the real app, backed by a fresh in-memory database.
+
+    StaticPool keeps every session on the same SQLite connection so data written
+    through one request is visible to the next — without it each request would
+    get its own empty database.
+    """
+    from httpx import ASGITransport, AsyncClient
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.pool import StaticPool
+
+    from src.api.main import app
+    from src.api.middleware.clerk import ClerkConfig, ClerkVerifier, set_verifier
+    from src.database.models import Base, import_all_models
+    from src.database.session import get_db
+
+    _, jwks = clerk_keypair
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    import_all_models()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def _override_get_db():
+        async with Session() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    set_verifier(ClerkVerifier(ClerkConfig(), jwks=jwks))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        yield client
+
+    app.dependency_overrides.clear()
+    set_verifier(None)
+    await engine.dispose()
+
+
 @pytest_asyncio.fixture
 async def icp(db, org):
     """An ICP targeting growth leaders at SaaS companies."""

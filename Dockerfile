@@ -44,8 +44,10 @@ COPY --from=frontend /app/frontend/dist ./frontend/dist
 RUN mkdir -p /app/data /app/logs && chown -R appuser:appuser /app
 USER appuser
 
-# Ensure a fresh deploy provisions its schema (Alembic is the long-term path).
-ENV AUTO_CREATE_TABLES=true \
+# Schema is provisioned by Alembic in the start command below, so create_all is
+# off here. Leaving both on would let a deploy quietly build tables that no
+# migration describes, which is how a schema drifts out from under its history.
+ENV AUTO_CREATE_TABLES=false \
     PYTHONUNBUFFERED=1
 
 EXPOSE 8000
@@ -54,4 +56,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f "http://localhost:${PORT:-8000}/healthz" || exit 1
 
-CMD ["sh", "-c", "uvicorn src.api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Migrate, then serve. The `&&` is load-bearing: if the schema cannot be brought
+# to head the container must fail its healthcheck rather than serve traffic
+# against a database it disagrees with.
+CMD ["sh", "-c", "python scripts/migrate.py && uvicorn src.api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

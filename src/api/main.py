@@ -7,6 +7,8 @@ agent runtime. This module exposes the ``app`` object that
 ``tests/test_campaigns_api.py`` and ``uvicorn src.api.main:app`` import.
 """
 
+import asyncio
+import contextlib
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -44,9 +46,13 @@ async def lifespan(app: FastAPI):
     app.state.redis = None
     app.state.task_orchestrator = None
 
-    # Bootstrap schema creation for first deploys (Postgres or SQLite). For
-    # production migrations use Alembic; this is a convenience for greenfield
-    # environments and is off unless explicitly enabled.
+    # Local convenience only: build the schema straight from the models.
+    #
+    # Deployments do NOT use this — they run `scripts/migrate.py` before the
+    # server starts (see the Dockerfile CMD). Enabling it in production would
+    # let create_all invent tables no migration describes, and the next real
+    # migration would then be written against a schema nobody can reproduce.
+    # Off unless explicitly enabled.
     if os.getenv("AUTO_CREATE_TABLES", "").lower() == "true":
         try:
             from src.database.models import Base, import_all_models
@@ -73,11 +79,65 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # pragma: no cover - depends on runtime env
         logger.warning("Redis unavailable (%s); campaign execution degraded", exc)
 
+    # Optional in-process scheduler.
+    #
+    # Production runs the scheduler as its own process (`python -m src.scheduler`)
+    # so a stalled sweep cannot degrade request handling and web replicas stay
+    # stateless. SCHEDULER_IN_PROCESS exists for local development, where running
+    # two processes to watch a warm-up day happen is friction with no benefit.
+    #
+    # A refusal to start is recorded on app.state and surfaced by /healthz rather
+    # than raised: the API is not the scheduler, so a misconfigured scheduler
+    # should not take the API down with it — but it must not be invisible either.
+    app.state.scheduler_task = None
+    app.state.scheduler_status = "not enabled"
+    await _maybe_start_scheduler(app)
+
     try:
         yield
     finally:
+        task = getattr(app.state, "scheduler_task", None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         if app.state.redis is not None:
             await app.state.redis.aclose()
+
+
+async def _maybe_start_scheduler(app: FastAPI) -> None:
+    """Start the in-process scheduler when explicitly asked to."""
+    from src.scheduler.config import SchedulerDisabled, check_startable, load_config
+
+    try:
+        config = load_config()
+    except SchedulerDisabled as exc:
+        app.state.scheduler_status = f"misconfigured: {exc}"
+        logger.warning("Scheduler configuration rejected: %s", exc)
+        return
+
+    if not config.in_process:
+        app.state.scheduler_status = (
+            "enabled, running out-of-process"
+            if config.enabled
+            else "not enabled"
+        )
+        return
+
+    try:
+        check_startable(config, redis_available=app.state.redis is not None)
+    except SchedulerDisabled as exc:
+        app.state.scheduler_status = f"refused to start: {exc}"
+        logger.warning("In-process scheduler refused to start: %s", exc)
+        return
+
+    from src.scheduler.runner import run_forever
+
+    app.state.scheduler_task = asyncio.create_task(
+        run_forever(config, redis=app.state.redis)
+    )
+    app.state.scheduler_status = f"running in-process ({'dry-run' if config.dry_run else 'live'})"
+    logger.info("In-process scheduler started (%s)", app.state.scheduler_status)
 
 
 app = FastAPI(
@@ -149,6 +209,21 @@ async def healthz(request: Request) -> dict:
         if components["redis"] == "ok" or os.getenv("ALLOW_UNCAPPED_SENDING", "").lower() == "true"
         else "disabled (caps cannot be enforced without Redis)"
     )
+
+    # The scheduler needs its own line, and the reason is specific: the warm-up
+    # programme has deliberately quiet days (one day in five plans no likes at
+    # all), so "nothing happened today" is normal and can never be the signal
+    # that something is wrong. Aliveness has to be reported separately from
+    # output, otherwise a dead scheduler is indistinguishable from a quiet one.
+    components["scheduler"] = getattr(request.app.state, "scheduler_status", "unknown")
+    try:
+        from src.scheduler import heartbeat
+
+        last = await heartbeat.last_tick(redis)
+        if last is not None:
+            components["scheduler_last_tick"] = last
+    except Exception as exc:  # pragma: no cover - depends on runtime env
+        components["scheduler_last_tick"] = {"error": str(exc)}
 
     return {"status": "ok", "components": components}
 

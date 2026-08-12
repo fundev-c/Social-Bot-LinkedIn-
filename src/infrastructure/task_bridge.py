@@ -12,7 +12,10 @@ It is deliberately thin and Redis-only (never touches the in-memory
 interaction agents subscribe to, records the task metadata under
 ``task:{task_id}``, and returns the task id. Completion flows back the other way
 as ``events:interaction_completed`` / ``events:interaction_failed`` events,
-which the API-side consumer maps to ``CampaignService.update_task_status``.
+which the API-side consumer maps to ``campaigns.service.apply_task_result`` (a
+module function, not a ``CampaignService`` method, because this path has no
+request context and so no org to scope a service to — it derives the tenant from
+the task's own campaign).
 """
 
 from __future__ import annotations

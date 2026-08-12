@@ -49,6 +49,33 @@ sessions produces a session that passes `whoami` and fails everything else.
 
 ## Step 2 — Connect and preflight
 
+### From the command line (best while validating endpoints)
+
+```bash
+CLERK_DEV_UNSAFE=true python scripts/validate_account.py
+```
+
+It prompts for both cookies without echoing them, connects the account, runs the
+read-only preflight and prints a pass/fail line per probe. Cookies are never
+printed, logged or written to disk, and are never taken as arguments — that would
+put a live credential in your shell history.
+
+It also **strips the quotes off `JSESSIONID` for you**, which is the mistake this
+page warns about below and the one with the nastiest symptom.
+
+While iterating on endpoint shapes, re-run against the same account instead of
+connecting a new one each time:
+
+```bash
+python scripts/validate_account.py --account-id <id>            # preflight again
+python scripts/validate_account.py --account-id <id> --rotate   # cookies expired
+```
+
+Exit code is 0 when the session is valid, 1 otherwise. `--api-base` points it at
+a deployed instance; `--token` supplies a real Clerk session JWT.
+
+### From the UI
+
 **Accounts → Connect account.** Paste both cookies, give it a label, pick a
 behaviour (Outreach for meeting new people, Engagement for nurturing an
 existing network).

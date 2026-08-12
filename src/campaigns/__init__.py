@@ -13,7 +13,7 @@ from .schemas import (
     CampaignProgress,
     CampaignStatus,
 )
-from .service import CampaignService
+from .service import CampaignService, apply_task_result
 from .repository import CampaignRepository
 
 __all__ = [
@@ -28,4 +28,5 @@ __all__ = [
     "CampaignStatus",
     "CampaignService",
     "CampaignRepository",
+    "apply_task_result",
 ]

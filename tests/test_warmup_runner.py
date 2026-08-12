@@ -1,11 +1,34 @@
 """
 Warm-up runner tests: does the programme actually *do* anything, and does it
 stay inside its own rules while doing it.
+
+Picking the day a test runs on
+------------------------------
+These tests used to run against the real clock and a random account id, and
+failed about half the time. Both causes were real behaviour, not bugs:
+
+* The daily plan is seeded by ``(account_id, day)``, and volume bands carry a
+  quiet-day probability — ``observe`` plans likes with ``probability=0.8``, so
+  one day in five is *deliberately* empty. A test asserting "it liked something"
+  on a random seed is asserting a coin flip.
+* The active window is 08:00-19:00, so an action scattered into the last hour
+  is not yet due at the 18:00 the tests used.
+
+Neither is fixed by pinning a lucky seed — the next change to a volume band
+would silently un-pin it. Instead ``day_that_plans`` searches forward from a
+fixed date for a day on which this account really is scheduled to perform the
+action under test, and ``end_of_day`` puts the clock past every scheduled time
+so nothing is merely early. Deterministic per account, and self-correcting if
+the bands are ever retuned.
+
+A test that wants the opposite — "nothing happens yet" — still uses a day with
+actions planned and simply asks *before* the window opens, so it proves pacing
+rather than passing because the plan happened to be empty.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
 
@@ -14,6 +37,10 @@ from src.outreach.models import OutreachSuggestion, SuggestionAction, Suggestion
 from src.warmup import planner, program, runner
 from src.warmup import service as warmup_service
 from src.warmup.models import AccountActivity, ActivityStatus
+
+# Any fixed weekday works; weekends only reduce volume, they don't stop it.
+SEARCH_FROM = date(2026, 6, 10)
+SEARCH_DAYS = 120
 
 
 class FeedTransport:
@@ -84,13 +111,52 @@ async def _targets(db, org, account, icp, count=4):
     return created
 
 
-async def _stage(db, account, key, days_ago=1):
-    """Put an account in a stage that started ``days_ago`` days back."""
-    planner.set_stage(
-        account, key, now=datetime.now(timezone.utc) - timedelta(days=days_ago)
-    )
+async def _stage(db, account, key, *, now, days_ago=1):
+    """Put an account in a stage that started ``days_ago`` before ``now``."""
+    planner.set_stage(account, key, now=now - timedelta(days=days_ago))
     await db.commit()
     await db.refresh(account)
+
+
+def day_that_plans(account, stage_key: str, action: str) -> date:
+    """
+    The first day from SEARCH_FROM on which this account is scheduled to do
+    ``action`` during ``stage_key``.
+
+    Uses the same planner the runner will, so what it finds is what the runner
+    will see. Searching rather than hard-coding a date means a retuned volume
+    band moves the test to a still-valid day instead of breaking it.
+    """
+    for offset in range(SEARCH_DAYS):
+        day = SEARCH_FROM + timedelta(days=offset)
+        if planner.plan_day(account, day=day, stage_key=stage_key).for_action(action):
+            return day
+
+    raise AssertionError(
+        f"no day in {SEARCH_DAYS} plans a {action!r} for account {account.id} during "
+        f"{stage_key!r}. Either the stage no longer permits that action, or its "
+        f"volume band now allows a zero draw on every day searched."
+    )
+
+
+def end_of_day(day: date) -> datetime:
+    """
+    Late enough that every action planned for ``day`` is due.
+
+    The runner only performs actions whose scheduled time has passed, so a test
+    asking at 18:00 silently skips anything the planner put in the 18:00-19:00
+    tail. Asking at the end of the day removes that from the result entirely.
+    """
+    return datetime.combine(day, time(hour=23, minute=59), tzinfo=timezone.utc)
+
+
+async def _ready(db, org, account, icp, stage_key, action, *, count=4):
+    """Import targets, place the account in a stage, and return a due `now`."""
+    await _targets(db, org, account, icp, count=count)
+    day = day_that_plans(account, stage_key, action)
+    now = end_of_day(day)
+    await _stage(db, account, stage_key, now=now)
+    return now
 
 
 # ----------------------------------------------------------------------
@@ -100,8 +166,7 @@ async def _stage(db, account, key, days_ago=1):
 
 async def test_runner_likes_icp_posts(db, org, account, icp, rate_limiter):
     """The core of warm-up: real engagement with the right people's content."""
-    await _targets(db, org, account, icp)
-    await _stage(db, account, "observe")
+    now = await _ready(db, org, account, icp, "observe", program.LIKE)
 
     transport = FeedTransport()
     result = await runner.run_today(
@@ -110,7 +175,7 @@ async def test_runner_likes_icp_posts(db, org, account, icp, rate_limiter):
         transport=transport,
         rate_limiter=rate_limiter,
         live=object(),
-        now=datetime.now(timezone.utc).replace(hour=18, minute=0),
+        now=now,
     )
 
     likes = [c for c in transport.calls if c[0] == "like"]
@@ -122,12 +187,11 @@ async def test_runner_likes_icp_posts(db, org, account, icp, rate_limiter):
 async def test_performed_activity_is_recorded_for_graduation(
     db, org, account, icp, rate_limiter
 ):
-    await _targets(db, org, account, icp)
-    await _stage(db, account, "observe")
+    now = await _ready(db, org, account, icp, "observe", program.LIKE)
 
     await runner.run_today(
         db, account, transport=FeedTransport(), rate_limiter=rate_limiter,
-        live=object(), now=datetime.now(timezone.utc).replace(hour=18, minute=0),
+        live=object(), now=now,
     )
 
     totals = await warmup_service.totals_for(db, account)
@@ -137,24 +201,24 @@ async def test_performed_activity_is_recorded_for_graduation(
 async def test_the_same_post_is_never_engaged_with_twice(
     db, org, account, icp, rate_limiter
 ):
-    await _targets(db, org, account, icp, count=1)
-    await _stage(db, account, "observe")
-    evening = datetime.now(timezone.utc).replace(hour=18, minute=0)
+    now = await _ready(db, org, account, icp, "observe", program.LIKE, count=1)
 
     transport = FeedTransport(posts=2)
     await runner.run_today(
         db, account, transport=transport, rate_limiter=rate_limiter,
-        live=object(), now=evening,
+        live=object(), now=now,
     )
     first = {c[1] for c in transport.calls if c[0] == "like"}
 
     transport2 = FeedTransport(posts=2)
     await runner.run_today(
         db, account, transport=transport2, rate_limiter=rate_limiter,
-        live=object(), now=evening,
+        live=object(), now=now,
     )
     second = {c[1] for c in transport2.calls if c[0] == "like"}
 
+    # Without this the test would also pass on a day that liked nothing at all.
+    assert first, "nothing was liked, so there is no repeat to detect"
     assert not (first & second), "re-liked a post it had already liked"
 
 
@@ -167,13 +231,12 @@ async def test_runner_never_performs_a_locked_action(
     db, org, account, icp, rate_limiter
 ):
     """An observing account must not comment, follow, connect or message."""
-    await _targets(db, org, account, icp)
-    await _stage(db, account, "observe")
+    now = await _ready(db, org, account, icp, "observe", program.LIKE)
 
     transport = FeedTransport()
     await runner.run_today(
         db, account, transport=transport, rate_limiter=rate_limiter,
-        live=object(), now=datetime.now(timezone.utc).replace(hour=18, minute=0),
+        live=object(), now=now,
     )
 
     performed = {c[0] for c in transport.calls}
@@ -181,16 +244,17 @@ async def test_runner_never_performs_a_locked_action(
 
 
 async def test_runner_respects_the_pause_switch(db, org, account, icp, rate_limiter):
-    await _targets(db, org, account, icp)
-    await _stage(db, account, "observe")
+    now = await _ready(db, org, account, icp, "observe", program.LIKE)
     planner.set_paused(account, True, "manual")
     await db.commit()
 
     transport = FeedTransport()
     result = await runner.run_today(
-        db, account, transport=transport, rate_limiter=rate_limiter, live=object()
+        db, account, transport=transport, rate_limiter=rate_limiter,
+        live=object(), now=now,
     )
 
+    # The day had likes planned and they were due; only the pause stopped them.
     assert result["performed"] == []
     assert not [c for c in transport.calls if c[0] in ("like", "follow")]
 
@@ -200,13 +264,12 @@ async def test_runner_refuses_to_act_without_a_rate_limiter(
 ):
     """No limiter means caps can't be proven, so nothing happens."""
     monkeypatch.delenv("ALLOW_UNCAPPED_SENDING", raising=False)
-    await _targets(db, org, account, icp)
-    await _stage(db, account, "observe")
+    now = await _ready(db, org, account, icp, "observe", program.LIKE)
 
     transport = FeedTransport()
     await runner.run_today(
         db, account, transport=transport, rate_limiter=None, live=object(),
-        now=datetime.now(timezone.utc).replace(hour=18, minute=0),
+        now=now,
     )
 
     assert not [c for c in transport.calls if c[0] == "like"]
@@ -215,15 +278,22 @@ async def test_runner_refuses_to_act_without_a_rate_limiter(
 async def test_only_actions_that_are_due_are_performed(
     db, org, account, icp, rate_limiter
 ):
-    """Calling the runner early must not pull the whole day forward."""
+    """
+    Calling the runner early must not pull the whole day forward.
+
+    The day is chosen to have likes planned, so this proves pacing rather than
+    passing because there was nothing to do.
+    """
     await _targets(db, org, account, icp)
-    await _stage(db, account, "react")
+    day = day_that_plans(account, "react", program.LIKE)
+    # 06:00 is before the 08:00 activity window, so nothing is due yet.
+    early = datetime.combine(day, time(hour=6), tzinfo=timezone.utc)
+    await _stage(db, account, "react", now=early)
 
     transport = FeedTransport()
-    # 06:00 is before the 08:00 activity window, so nothing is due.
     result = await runner.run_today(
         db, account, transport=transport, rate_limiter=rate_limiter, live=object(),
-        now=datetime.now(timezone.utc).replace(hour=6, minute=0),
+        now=early,
     )
 
     assert result["performed"] == []
@@ -233,13 +303,12 @@ async def test_only_actions_that_are_due_are_performed(
 async def test_a_challenge_during_warmup_pauses_the_account(
     db, org, account, icp, rate_limiter
 ):
-    await _targets(db, org, account, icp)
-    await _stage(db, account, "observe")
+    now = await _ready(db, org, account, icp, "observe", program.LIKE)
 
     await runner.run_today(
         db, account, transport=FeedTransport(challenge=True),
         rate_limiter=rate_limiter, live=object(),
-        now=datetime.now(timezone.utc).replace(hour=18, minute=0),
+        now=now,
     )
 
     assert account.status == "rate_limited"
@@ -250,12 +319,11 @@ async def test_failures_are_recorded_rather_than_silently_dropped(
 ):
     from sqlalchemy import select
 
-    await _targets(db, org, account, icp)
-    await _stage(db, account, "observe")
+    now = await _ready(db, org, account, icp, "observe", program.LIKE)
 
     await runner.run_today(
         db, account, transport=FeedTransport(fail=True), rate_limiter=rate_limiter,
-        live=object(), now=datetime.now(timezone.utc).replace(hour=18, minute=0),
+        live=object(), now=now,
     )
 
     rows = list(
@@ -287,13 +355,12 @@ async def test_comments_are_queued_for_approval_not_posted(
     """Comments are published under the user's name, so a human sees them first."""
     from sqlalchemy import select
 
-    await _targets(db, org, account, icp)
-    await _stage(db, account, "converse", days_ago=1)
+    now = await _ready(db, org, account, icp, "converse", program.COMMENT)
 
     transport = FeedTransport()
     result = await runner.run_today(
         db, account, transport=transport, rate_limiter=rate_limiter, live=object(),
-        now=datetime.now(timezone.utc).replace(hour=18, minute=0),
+        now=now,
     )
 
     # Nothing was actually commented on LinkedIn.
@@ -322,12 +389,11 @@ async def test_queued_comment_references_the_post_it_replies_to(
 ):
     from sqlalchemy import select
 
-    await _targets(db, org, account, icp)
-    await _stage(db, account, "converse", days_ago=1)
+    now = await _ready(db, org, account, icp, "converse", program.COMMENT)
 
     await runner.run_today(
         db, account, transport=FeedTransport(), rate_limiter=rate_limiter,
-        live=object(), now=datetime.now(timezone.utc).replace(hour=18, minute=0),
+        live=object(), now=now,
     )
 
     queued = (

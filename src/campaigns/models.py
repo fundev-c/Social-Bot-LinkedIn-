@@ -40,6 +40,10 @@ class Campaign(Base):
 
     A campaign groups multiple LinkedIn URLs to engage with,
     using specified accounts and actions (like/comment).
+
+    Owned by an Organization, like every other tenant-scoped row in the system.
+    ``org_id`` is not optional: a campaign with no owner is reachable by every
+    tenant, which is how these routes leaked before.
     """
     __tablename__ = "campaigns"
 
@@ -48,6 +52,21 @@ class Campaign(Base):
         primary_key=True,
         default=uuid.uuid4
     )
+
+    # Tenancy. Every query in CampaignRepository filters on org_id.
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Who created it, for attribution in the admin view. Nullable so removing a
+    # team member does not take their campaigns with them.
+    created_by_user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text)
 

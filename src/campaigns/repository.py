@@ -2,6 +2,17 @@
 Campaign repository for database operations.
 
 Provides async CRUD operations for campaigns and related entities.
+
+Tenancy
+-------
+``CampaignRepository`` and ``IdempotencyRepository`` are constructed with an
+``org_id`` and every query they issue is filtered by it. There is deliberately
+no "unscoped" mode and no ``org_id=None`` sentinel: a repository you can
+accidentally build without a tenant is the bug this scoping exists to prevent.
+
+A campaign belonging to another org therefore reads as *absent* rather than
+*forbidden* — callers raise 404, which avoids confirming that someone else's
+campaign id exists.
 """
 
 import uuid
@@ -19,14 +30,28 @@ logger = structlog.get_logger()
 
 
 class CampaignRepository:
-    """Repository for Campaign database operations."""
+    """Repository for Campaign database operations, scoped to one organization."""
 
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: AsyncSession, org_id: uuid.UUID):
         self.session = session
+        self.org_id = org_id
 
-    async def create(self, data: CampaignCreate) -> Campaign:
-        """Create a new campaign."""
+    def _scoped(self, include_deleted: bool = False):
+        """Base SELECT restricted to this org. Every read goes through here."""
+        query = select(Campaign).where(Campaign.org_id == self.org_id)
+        if not include_deleted:
+            query = query.where(Campaign.deleted_at.is_(None))
+        return query
+
+    async def create(
+        self,
+        data: CampaignCreate,
+        created_by_user_id: Optional[uuid.UUID] = None,
+    ) -> Campaign:
+        """Create a new campaign owned by this repository's org."""
         campaign = Campaign(
+            org_id=self.org_id,
+            created_by_user_id=created_by_user_id,
             name=data.name,
             description=data.description,
             target_urls=data.target_urls,
@@ -40,7 +65,12 @@ class CampaignRepository:
         self.session.add(campaign)
         await self.session.commit()
         await self.session.refresh(campaign)
-        logger.info("campaign_created", campaign_id=str(campaign.id), name=campaign.name)
+        logger.info(
+            "campaign_created",
+            campaign_id=str(campaign.id),
+            org_id=str(self.org_id),
+            name=campaign.name,
+        )
         return campaign
 
     async def get_by_id(
@@ -48,20 +78,17 @@ class CampaignRepository:
         campaign_id: uuid.UUID,
         include_deleted: bool = False
     ) -> Optional[Campaign]:
-        """Get campaign by ID."""
-        query = select(Campaign).where(Campaign.id == campaign_id)
-        if not include_deleted:
-            query = query.where(Campaign.deleted_at.is_(None))
+        """Get campaign by ID. Another org's campaign resolves to None."""
+        query = self._scoped(include_deleted).where(Campaign.id == campaign_id)
         result = await self.session.execute(query)
         return result.scalar_one_or_none()
 
     async def get_with_tasks(self, campaign_id: uuid.UUID) -> Optional[Campaign]:
         """Get campaign with its tasks loaded."""
         query = (
-            select(Campaign)
+            self._scoped()
             .options(selectinload(Campaign.tasks))
             .where(Campaign.id == campaign_id)
-            .where(Campaign.deleted_at.is_(None))
         )
         result = await self.session.execute(query)
         return result.scalar_one_or_none()
@@ -72,9 +99,9 @@ class CampaignRepository:
         page_size: int = 20,
         status: Optional[str] = None
     ) -> Tuple[List[Campaign], int]:
-        """List campaigns with pagination."""
+        """List this org's campaigns with pagination."""
         # Base query
-        query = select(Campaign).where(Campaign.deleted_at.is_(None))
+        query = self._scoped()
 
         # Filter by status if provided
         if status:
@@ -182,6 +209,7 @@ class CampaignRepository:
         stmt = (
             update(Campaign)
             .where(Campaign.id == campaign_id)
+            .where(Campaign.org_id == self.org_id)
             .values(
                 completed_tasks=Campaign.completed_tasks + completed,
                 failed_tasks=Campaign.failed_tasks + failed
@@ -214,7 +242,15 @@ class CampaignRepository:
 
 
 class CampaignTaskRepository:
-    """Repository for CampaignTask database operations."""
+    """
+    Repository for CampaignTask database operations.
+
+    Not org-scoped, and deliberately so: tasks are only ever reached through a
+    campaign whose ownership the caller has already checked, or by
+    ``orchestrator_task_id`` — an opaque id minted by the orchestrator that no
+    API client supplies. Adding a tenant filter here would imply user input
+    reaches it, which it must not.
+    """
 
     def __init__(self, session: AsyncSession):
         self.session = session
@@ -293,16 +329,27 @@ class CampaignTaskRepository:
 
 
 class IdempotencyRepository:
-    """Repository for idempotency key operations."""
+    """
+    Repository for idempotency key operations, scoped to one organization.
 
-    def __init__(self, session: AsyncSession):
+    Keys are chosen by the client, so two orgs can pick the same one. The stored
+    primary key is therefore namespaced as ``{org_id}:{key}``: without that, org
+    B replaying org A's key would be handed org A's campaign as the "cached
+    response" — the same leak as an unscoped read, arriving by a quieter route.
+    """
+
+    def __init__(self, session: AsyncSession, org_id: uuid.UUID):
         self.session = session
+        self.org_id = org_id
+
+    def _namespaced(self, key: str) -> str:
+        return f"{self.org_id}:{key}"
 
     async def get(self, key: str) -> Optional[IdempotencyKey]:
         """Get idempotency key if exists and not expired."""
         query = select(IdempotencyKey).where(
             and_(
-                IdempotencyKey.key == key,
+                IdempotencyKey.key == self._namespaced(key),
                 IdempotencyKey.expires_at > datetime.utcnow()
             )
         )
@@ -323,7 +370,7 @@ class IdempotencyRepository:
             return existing
 
         idempotency_key = IdempotencyKey(
-            key=key,
+            key=self._namespaced(key),
             resource_type=resource_type,
             resource_id=resource_id,
             response_code=response_code,

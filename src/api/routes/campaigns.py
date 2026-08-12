@@ -2,6 +2,12 @@
 Campaign API Routes
 
 Provides CRUD and execution endpoints for LinkedIn campaigns.
+
+Every route here is authenticated and org-scoped through
+``get_campaign_service``, which builds the service from the caller's resolved
+tenancy context. A campaign belonging to another organization is reported as
+404, not 403: telling an unauthorized caller that an id exists is itself a
+disclosure.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status, Query
@@ -29,16 +35,22 @@ from src.api.middleware.idempotency import (
     get_idempotency_key,
     require_idempotency_key,
 )
+from src.api.middleware.clerk import RequestContext, get_request_context
 
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 
 
 def get_campaign_service(
     request: Request,
+    ctx: RequestContext = Depends(get_request_context),
     db: AsyncSession = Depends(get_db),
 ) -> CampaignService:
     """
-    Dependency to get a CampaignService instance.
+    Dependency to get a CampaignService instance for the calling org.
+
+    Depending on ``get_request_context`` is what authenticates these routes:
+    an unauthenticated request never reaches a handler, and an authenticated one
+    can only ever be handed a service bound to its own ``org_id``.
 
     The campaign<->agent task bridge and Redis client are attached to
     ``app.state`` by the lifespan when Redis is reachable; when they are absent
@@ -47,7 +59,13 @@ def get_campaign_service(
     """
     orchestrator = getattr(request.app.state, "task_orchestrator", None)
     redis_client = getattr(request.app.state, "redis", None)
-    return CampaignService(session=db, orchestrator=orchestrator, redis_client=redis_client)
+    return CampaignService(
+        session=db,
+        org_id=uuid.UUID(ctx.org_id),
+        user_id=uuid.UUID(ctx.user_id),
+        orchestrator=orchestrator,
+        redis_client=redis_client,
+    )
 
 
 @router.post(
@@ -89,15 +107,18 @@ async def create_campaign(
 async def list_campaigns(
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
-    status: Optional[str] = Query(None, description="Filter by status"),
+    # Named status_filter, exposed as ?status=: a parameter called `status`
+    # shadows fastapi.status inside the handler, which turns any
+    # `status.HTTP_*` reference into an AttributeError.
+    status_filter: Optional[str] = Query(None, alias="status", description="Filter by status"),
     service: CampaignService = Depends(get_campaign_service)
 ):
     """
-    List all campaigns with pagination.
+    List the calling organization's campaigns with pagination.
 
     Supports filtering by status: draft, scheduled, running, paused, completed, failed
     """
-    campaigns, total = await service.list_campaigns(page, page_size, status)
+    campaigns, total = await service.list_campaigns(page, page_size, status_filter)
     return CampaignListResponse(
         campaigns=[service.to_response(c) for c in campaigns],
         total=total,
@@ -275,7 +296,9 @@ async def get_campaign_status(
 )
 async def get_campaign_tasks(
     campaign_id: uuid.UUID,
-    status: Optional[str] = Query(None, description="Filter by task status"),
+    # See list_campaigns: `status` as a parameter name shadows fastapi.status,
+    # which broke the 404 branch below with an AttributeError.
+    status_filter: Optional[str] = Query(None, alias="status", description="Filter by task status"),
     service: CampaignService = Depends(get_campaign_service)
 ):
     """
@@ -284,7 +307,7 @@ async def get_campaign_tasks(
     Tasks are created when a campaign is started.
     """
     try:
-        tasks = await service.get_campaign_tasks(campaign_id, status)
+        tasks = await service.get_campaign_tasks(campaign_id, status_filter)
         return [CampaignTaskResponse.model_validate(t) for t in tasks]
     except CampaignNotFoundError:
         raise HTTPException(

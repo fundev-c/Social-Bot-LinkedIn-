@@ -58,8 +58,25 @@ class CompositeTransport:
                 result.detail["fallback_reason"] = str(exc)
                 return result
             except self.fallback_on as exc2:
+                # Report BOTH failures. Reporting only the fallback's is how a
+                # real diagnosis gets lost: while the Playwright executor is
+                # unbound, its error is always the same uninformative sentence,
+                # and it would mask the Voyager response that actually explains
+                # what went wrong — exactly what you need when validating the
+                # mobile endpoints against a live account.
                 return TransportResult(
-                    success=False, action=action, via=self.fallback.name, error=str(exc2)
+                    success=False,
+                    action=action,
+                    via=self.fallback.name,
+                    error=(
+                        f"{self.primary.name}: {exc} || {self.fallback.name}: {exc2}"
+                    ),
+                    detail={
+                        "primary_via": self.primary.name,
+                        "primary_error": str(exc),
+                        "fallback_via": self.fallback.name,
+                        "fallback_error": str(exc2),
+                    },
                 )
 
     async def like(self, account: Any, activity_urn: str) -> TransportResult:

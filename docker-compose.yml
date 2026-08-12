@@ -185,9 +185,18 @@ services:
     networks:
       - linkedin-network
 
-  # Scheduler Agent (dedicated instance)
-  scheduler-agent:
-    build: 
+  # Scheduler -- what makes the programme autonomous.
+  #
+  # This service used to run `main.py --agents scheduler`, which booted
+  # SchedulerAgent: a SkeletonAgent whose _start_agent_tasks returns []. It came
+  # up healthy and did nothing, which is worse than not existing -- anyone
+  # reading this file concluded scheduling was handled.
+  #
+  # It now runs the real scheduler (src/scheduler). Off unless SCHEDULER_ENABLED
+  # is set, and it exits non-zero with an explanation rather than idling, so a
+  # misconfiguration is a visibly failing container instead of a quiet one.
+  scheduler:
+    build:
       context: .
       dockerfile: Dockerfile
       target: production
@@ -196,16 +205,26 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      # The app container runs scripts/migrate.py before serving, so waiting on
+      # it keeps the scheduler from querying a schema that does not exist yet.
+      # Not fatal if it did -- the loop survives a failed sweep and retries --
+      # but a clean first tick beats a confusing one in the logs.
+      linkedin-app:
+        condition: service_started
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_DB=0
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=${DATABASE_URL:-}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
       - LOG_LEVEL=INFO
+      # Deliberately off by default: this drives real activity on real accounts.
+      - SCHEDULER_ENABLED=${SCHEDULER_ENABLED:-false}
+      - SCHEDULER_DRY_RUN=${SCHEDULER_DRY_RUN:-false}
+      - SCHEDULER_INTERVAL_SECONDS=${SCHEDULER_INTERVAL_SECONDS:-300}
     volumes:
       - ./config:/app/config:ro
       - ./data:/app/data
       - ./logs:/app/logs
-    command: ["--agents", "scheduler"]
+    command: ["python", "-m", "src.scheduler"]
     networks:
       - linkedin-network
 

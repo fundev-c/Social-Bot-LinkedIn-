@@ -112,6 +112,30 @@ async def test_no_fallback_returns_failure_on_unavailable():
     assert not result.success
 
 
+async def test_both_failing_reports_the_primary_error_too():
+    """
+    When both transports fail, the primary's error must survive.
+
+    Until the Playwright executor is bound its failure is always the same
+    uninformative sentence. If that were the only thing reported, it would mask
+    the Voyager response — which is the one piece of information needed to fix a
+    drifted endpoint shape against a live account.
+    """
+    comp = CompositeTransport(
+        FakeTransport("mobile", "unavailable"),
+        FakeTransport("playwright", "unavailable"),
+    )
+
+    result = await comp.like(_account(), "urn:activity:1")
+
+    assert not result.success
+    assert "mobile unavailable" in result.error
+    assert "playwright unavailable" in result.error
+    assert result.detail["primary_error"] == "mobile unavailable"
+    assert result.detail["primary_via"] == "mobile"
+    assert result.detail["fallback_error"] == "playwright unavailable"
+
+
 # --- Mobile scaffold falls back today ---
 
 async def test_mobile_scaffold_signals_unavailable():
